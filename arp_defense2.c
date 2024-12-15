@@ -1,4 +1,4 @@
-// ARP Spoofing Defense System - Enhanced Version
+// ARP Spoofing Defense System
 // Author: Updated Version
 // License: MIT License
 
@@ -25,7 +25,7 @@ void packet_handler(u_char *user_data, const struct pcap_pkthdr *pkt_header, con
 void load_bindings(const char *filename);
 bool is_valid_binding(const char *ip, const char *mac);
 void log_event(const char *event_type, const char *ip, const char *mac, const char *reason);
-void broadcast_arp_response(const char *ip, const char *mac);
+void broadcast_arp_response(const char *iface, const char *ip, const char *mac);
 void setup_firewall_rule(const char *ip);
 
 // Global variables
@@ -46,20 +46,27 @@ int main(int argc, char *argv[]) {
     // Load IP-MAC bindings
     load_bindings(BINDING_FILE);
 
-    // Find a network device to capture on
-    dev = pcap_lookupdev(errbuf);
-    if (dev == NULL) {
-        fprintf(stderr, "Error finding device: %s\n", errbuf);
+    // Find available devices
+    pcap_if_t *alldevs;
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
+        fprintf(stderr, "Error finding devices: %s\n", errbuf);
         return 1;
     }
+
+    // Select the first device
+    dev = alldevs->name;
     printf("Using device: %s\n", dev);
 
     // Open the device for live capture
     handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
     if (handle == NULL) {
         fprintf(stderr, "Error opening device: %s\n", errbuf);
+        pcap_freealldevs(alldevs);
         return 1;
     }
+
+    // Free device list
+    pcap_freealldevs(alldevs);
 
     // Set signal handler for clean exit
     signal(SIGINT, handle_signal);
@@ -77,7 +84,7 @@ int main(int argc, char *argv[]) {
 
     // Start packet processing loop
     while (running) {
-        pcap_dispatch(handle, -1, packet_handler, NULL);
+        pcap_dispatch(handle, -1, packet_handler, (u_char *)dev);
     }
 
     // Cleanup
@@ -99,13 +106,21 @@ void packet_handler(u_char *user_data, const struct pcap_pkthdr *pkt_header, con
              arp_packet->arp_sha[0], arp_packet->arp_sha[1], arp_packet->arp_sha[2],
              arp_packet->arp_sha[3], arp_packet->arp_sha[4], arp_packet->arp_sha[5]);
 
+    printf("[DEBUG] Captured ARP packet: IP = %s, MAC = %s\n", sender_ip, sender_mac);
+
     if (!is_valid_binding(sender_ip, sender_mac)) {
         printf("[ALERT] Spoofing detected from IP: %s MAC: %s\n", sender_ip, sender_mac);
         log_event("spoofing_detected", sender_ip, sender_mac, "Invalid MAC for IP");
         setup_firewall_rule(sender_ip);
-        broadcast_arp_response(sender_ip, "<correct_mac>");
+
+        // Use correct MAC address for the ARP response
+        const char *correct_mac = "08:00:27:b0:a5:10";
+        broadcast_arp_response((char *)user_data, sender_ip, correct_mac);
+
+        printf("[INFO] ARP response broadcasted to correct IP-MAC pair\n");
     }
 }
+
 
 void load_bindings(const char *filename) {
     FILE *file = fopen(filename, "r");
@@ -118,8 +133,15 @@ void load_bindings(const char *filename) {
     long length = ftell(file);
     fseek(file, 0, SEEK_SET);
 
-    char *content = malloc(length);
+    char *content = malloc(length + 1);  // Ensure enough space for null terminator
+    if (!content) {
+        perror("Memory allocation failed");
+        fclose(file);
+        exit(1);
+    }
+
     fread(content, 1, length, file);
+    content[length] = '\0';  // Ensure the string is null-terminated
     fclose(file);
 
     bindings = json_tokener_parse(content);
@@ -129,7 +151,11 @@ void load_bindings(const char *filename) {
         fprintf(stderr, "Error parsing bindings file\n");
         exit(1);
     }
+
+    // Log the bindings loaded for debugging purposes
+    printf("[INFO] Loaded IP-MAC bindings: %s\n", json_object_to_json_string(bindings));
 }
+
 
 bool is_valid_binding(const char *ip, const char *mac) {
     struct json_object *value;
@@ -190,21 +216,12 @@ void broadcast_arp_response(const char *iface, const char *ip, const char *mac) 
 
     struct sockaddr_ll socket_address = {0};
     socket_address.sll_ifindex = if_nametoindex(iface);
-    
-    if (socket_address.sll_ifindex == 0) {
-        printf("Error: Interface not found or not active: %s\n", iface);
-        close(sockfd);
-        return;
-    }
-
     socket_address.sll_halen = ETH_ALEN;
     memset(socket_address.sll_addr, 0xff, ETH_ALEN);
 
     // Send ARP response
     if (sendto(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *) &socket_address, sizeof(socket_address)) < 0) {
         perror("Failed to send ARP response");
-    } else {
-        printf("[INFO] ARP response broadcasted to correct IP-MAC pair\n");
     }
 
     close(sockfd);
@@ -214,5 +231,14 @@ void broadcast_arp_response(const char *iface, const char *ip, const char *mac) 
 void setup_firewall_rule(const char *ip) {
     char command[256];
     snprintf(command, sizeof(command), "iptables -A INPUT -s %s -j DROP", ip);
-    system(command);
+
+    printf("[INFO] Adding firewall rule: %s\n", command);
+
+    int result = system(command);
+    if (result == -1) {
+        perror("Error executing iptables command");
+    } else {
+        printf("[INFO] Firewall rule added successfully for IP: %s\n", ip);
+    }
 }
+
